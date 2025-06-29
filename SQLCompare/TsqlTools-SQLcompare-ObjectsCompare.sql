@@ -28,132 +28,103 @@ Use a centalized server  and create LinkedServers from the centralized server.
 Or Create LinkedServer on SourceDB server then run this query on SourceDB server.
 
 ========================================================================*/
-DECLARE @SOURCEDBSERVER VARCHAR(100) 
-DECLARE @DESTINATIONDBSERVER VARCHAR(100) 
-DECLARE @SOURCE_SQL_DBNAME NVARCHAR(300) 
-DECLARE @SOURCE_DATABASENAME TABLE 
-  ( 
-     dbname VARCHAR(100) 
-  ) 
+-- =============================================
+-- Author:      [Your Name]
+-- Description: Compare objects between two SQL Server instances
+-- =============================================
 
-SELECT @SOURCEDBSERVER = '[db01]' --==> Replace Your Source DB serverName Here
+DECLARE @SOURCEDBSERVER VARCHAR(100) = '[db01]'  -- Replace with your source DB server name
+DECLARE @DESTINATIONDBSERVER VARCHAR(100) = '[db02]'  -- Replace with your target DB server name
 
-SELECT @DESTINATIONDBSERVER = '[db02]' --==> Replace Your Target DB serverName Here
+DECLARE @SOURCE_SQL_DBNAME NVARCHAR(MAX)
+DECLARE @SOURCE_DATABASENAME TABLE (dbname VARCHAR(100))
 
-SELECT @SOURCE_SQL_DBNAME = 'select name from ' + @SOURCEDBSERVER 
-                            + '.master.sys.databases where database_id>4' 
+-- Get list of user databases (database_id > 4 excludes system dbs)
+SET @SOURCE_SQL_DBNAME = 'SELECT name FROM ' + QUOTENAME(@SOURCEDBSERVER) + '.master.sys.databases WHERE database_id > 4'
 
-INSERT INTO @SOURCE_DATABASENAME 
-EXEC Sp_executesql 
-  @SOURCE_SQL_DBNAME 
+INSERT INTO @SOURCE_DATABASENAME
+EXEC sp_executesql @SOURCE_SQL_DBNAME
 
-CREATE TABLE #objectstaus 
-  ( 
-     dbname       NVARCHAR(500) 
-     , objectname NVARCHAR(500) 
-     , objecttype VARCHAR(500) 
-     , status     NVARCHAR(500) 
-  ) 
+-- Temporary table for results
+CREATE TABLE #objectstatus (
+    dbname       NVARCHAR(500),
+    objectname   NVARCHAR(500),
+    objecttype   VARCHAR(500),
+    status       NVARCHAR(500)
+)
 
-DECLARE dbcursor CURSOR FOR 
-  SELECT dbname 
-  FROM   @SOURCE_DATABASENAME 
+DECLARE db_cursor CURSOR LOCAL FAST_FORWARD FOR
+    SELECT dbname FROM @SOURCE_DATABASENAME
 
-OPEN dbcursor 
+DECLARE @SOURCE_DBNAME VARCHAR(100)
+OPEN db_cursor
 
-DECLARE @SOURCE_DBNAME VARCHAR(100) 
+FETCH NEXT FROM db_cursor INTO @SOURCE_DBNAME
 
-FETCH next FROM dbcursor INTO @SOURCE_DBNAME 
+BEGIN TRY
+    WHILE @@FETCH_STATUS = 0
+    BEGIN
+        DECLARE @SOURCEDBNAMEFULL NVARCHAR(300) = QUOTENAME(@SOURCEDBSERVER) + '.' + QUOTENAME(@SOURCE_DBNAME)
+        DECLARE @DESTDBNAMEFULL   NVARCHAR(300) = QUOTENAME(@DESTINATIONDBSERVER) + '.' + QUOTENAME(@SOURCE_DBNAME)
+        DECLARE @SQL NVARCHAR(MAX)
 
-WHILE @@FETCH_STATUS = 0 
-  BEGIN 
-      DECLARE @SOURCEDBSERVERNAME SYSNAME 
-      DECLARE @DESTDBNAME SYSNAME 
-      DECLARE @SQL VARCHAR(max) 
+        SET @SQL = N'
+            SELECT 
+                ''' + @SOURCE_DBNAME + ''' AS dbname,
+                ISNULL(SoSource.name, SoDestination.name) AS objectname,
+                ISNULL(SoSource.type_desc, SoDestination.type_desc) AS objecttype,
+                CASE
+                    WHEN SoSource.object_id IS NULL THEN ''Available on ' + @DESTDBNAMEFULL + '''
+                    WHEN SoDestination.object_id IS NULL THEN ''Available on ' + @SOURCEDBNAMEFULL + '''
+                    ELSE ''Available On Both Servers''
+                END AS status
+            FROM (
+                SELECT * FROM ' + @SOURCEDBNAMEFULL + '.sys.objects 
+                WHERE type_desc NOT IN (''INTERNAL_TABLE'',''SYSTEM_TABLE'',''SERVICE_QUEUE'')
+            ) SoSource
+            FULL OUTER JOIN (
+                SELECT * FROM ' + @DESTDBNAMEFULL + '.sys.objects
+                WHERE type_desc NOT IN (''INTERNAL_TABLE'',''SYSTEM_TABLE'',''SERVICE_QUEUE'')
+            ) SoDestination
+                ON SoSource.name = SoDestination.name COLLATE database_default
+                AND SoSource.type = SoDestination.type COLLATE database_default
+            ORDER BY ISNULL(SoSource.type, SoDestination.type)
+        '
 
-      SELECT @SOURCEDBSERVERNAME = (SELECT 
-             @SOURCEDBSERVER + '.' + @SOURCE_DBNAME) 
+        INSERT INTO #objectstatus (dbname, objectname, objecttype, status)
+        EXEC sp_executesql @SQL
 
-      SELECT @DESTDBNAME = @DESTINATIONDBSERVER + '.' + @SOURCE_DBNAME 
+        FETCH NEXT FROM db_cursor INTO @SOURCE_DBNAME
+    END
+END TRY
+BEGIN CATCH
+    PRINT 'Error: ' + ERROR_MESSAGE()
+END CATCH
 
-      SELECT @SQL = '  SELECT ' + '''' + @SOURCE_DBNAME + '''' + ' as DB, 
-      ISNULL(SoSource.name,SoDestination.name) ''Object Name'' , SoDestination.type_desc ,  
-      CASE 
-        WHEN SoSource.object_id IS NULL THEN +  ''  Available on  ' + @DESTDBNAME + ''' COLLATE database_default  
-        WHEN SoDestination.object_id IS NULL THEN +  '' Available On ' + @SOURCEDBSERVERNAME + ''' COLLATE database_default     
-      ELSE   
-      + '' Available On Both Servers'' COLLATE database_default END ''Status''
-      FROM (SELECT * FROM ' 
-                    + @SOURCEDBSERVERNAME 
-                    + '.SYS.objects WHERE Type_desc not in  (''INTERNAL_TABLE'',''SYSTEM_TABLE'',''SERVICE_QUEUE'')) SoSource 
-                      FULL OUTER JOIN (SELECT * FROM ' + @DESTDBNAME 
-                    + '.SYS.objects 
-                    WHERE Type_desc not in (''INTERNAL_TABLE'',''SYSTEM_TABLE'',''SERVICE_QUEUE'')) 
-                    SoDestination  ON SoSource.name = SoDestination.name COLLATE database_default 
-                    AND SoSource.type = SoDestination.type 
-                    COLLATE database_default 
-                    ORDER BY isnull(SoSource.type,SoDestination.type)' 
+CLOSE db_cursor
+DEALLOCATE db_cursor
 
-      INSERT INTO #objectstaus 
-      EXEC (@SQL) 
+-- Example: Show all object types. Adjust WHERE as needed.
+SELECT * FROM #objectstatus WHERE objecttype = 'USER_TABLE' ORDER BY dbname, objectname
+SELECT * FROM #objectstatus WHERE objecttype = 'CHECK_CONSTRAINT' ORDER BY dbname, objectname
+SELECT * FROM #objectstatus WHERE objecttype = 'DEFAULT_CONSTRAINT' ORDER BY dbname, objectname
+SELECT * FROM #objectstatus WHERE objecttype = 'FOREIGN_KEY_CONSTRAINT' ORDER BY dbname, objectname
+SELECT * FROM #objectstatus WHERE objecttype = 'PRIMARY_KEY_CONSTRAINT' ORDER BY dbname, objectname
+SELECT * FROM #objectstatus WHERE objecttype = 'UNIQUE_CONSTRAINT' ORDER BY dbname, objectname
+SELECT * FROM #objectstatus WHERE objecttype = 'SQL_TRIGGER' ORDER BY dbname, objectname
+SELECT * FROM #objectstatus WHERE objecttype = 'VIEW' ORDER BY dbname, objectname
+SELECT * FROM #objectstatus WHERE objecttype = 'SQL_STORED_PROCEDURE' ORDER BY dbname, objectname
 
-      FETCH next FROM dbcursor INTO @SOURCE_DBNAME 
-  END 
+-- Select all other object types
+SELECT * FROM #objectstatus
+WHERE objecttype NOT IN (
+    'USER_TABLE', 'CHECK_CONSTRAINT', 'DEFAULT_CONSTRAINT',
+    'FOREIGN_KEY_CONSTRAINT', 'PRIMARY_KEY_CONSTRAINT',
+    'SQL_TRIGGER', 'VIEW', 'SQL_STORED_PROCEDURE', 'UNIQUE_CONSTRAINT'
+)
+ORDER BY dbname, objectname
 
-CLOSE dbcursor 
-
-DEALLOCATE dbcursor 
-
-SELECT * 
-FROM   #objectstaus where objecttype='USER_TABLE'
-ORDER  BY dbname ASC 
-
-SELECT * 
-FROM   #objectstaus where objecttype='CHECK_CONSTRAINT'
-ORDER  BY dbname ASC 
-
-SELECT * 
-FROM   #objectstaus where objecttype='DEFAULT_CONSTRAINT'
-ORDER  BY dbname ASC 
-
-SELECT * 
-FROM   #objectstaus where objecttype='FOREIGN_KEY_CONSTRAINT'
-ORDER  BY dbname ASC 
-
-SELECT * 
-FROM   #objectstaus where objecttype='PRIMARY_KEY_CONSTRAINT'
-ORDER  BY dbname ASC 
-
-SELECT * 
-FROM   #objectstaus where objecttype='UNIQUE_CONSTRAINT'
-ORDER  BY dbname ASC 
-
-SELECT * 
-FROM   #objectstaus where objecttype='SQL_TRIGGER'
-ORDER  BY dbname ASC 
-
-SELECT * 
-FROM   #objectstaus where objecttype='VIEW'
-ORDER  BY dbname ASC 
-
-SELECT * 
-FROM   #objectstaus where objecttype='SQL_STORED_PROCEDURE'
-ORDER  BY dbname ASC 
-
-SELECT * 
-FROM   #objectstaus where objecttype not in ('USER_TABLE',
-'CHECK_CONSTRAINT',
-'DEFAULT_CONSTRAINT',
-'FOREIGN_KEY_CONSTRAINT',
-'PRIMARY_KEY_CONSTRAINT',
-'SQL_TRIGGER',
-'VIEW',
-'SQL_STORED_PROCEDURE'
-'UNIQUE_CONSTRAINT')
-ORDER  BY dbname ASC 
-DROP TABLE #objectstaus 
- 
-
+DROP TABLE IF EXISTS #objectstatus
  
 
 
