@@ -1,4 +1,4 @@
-/*****************************************************************
+C/*****************************************************************
                  ----------------------- 
                  T-SQLtools - DBA-Config
                  -----------------------
@@ -59,22 +59,36 @@ DECLARE @TempfileSize nvarchar(100) = '100MB'
 
 ******************************************************************/
 
--- Global Declarations
-DECLARE @MinMem int
-DECLARE @MaxMem int
-DECLARE @P_MAXDOP INT
-DECLARE @CostThresHold INT
-DECLARE @DBfile nvarchar(500)
-DECLARE @Logfile nvarchar(500)
-DECLARE @Backup NVARCHAR(500)
-DECLARE @TempfilePath nvarchar(500) -- its mandatory
-DECLARE @TempfileSize nvarchar(100) 
+-- ========================================
+-- SQL Server Configuration Script
+-- ========================================
 
+-- Variable Declarations & Initialization
+-- ========================================
+-- SQL Server Configuration Script
+-- ========================================
 
+-- Variable Declarations & Initialization
+DECLARE 
+    @MinMem INT = 0,
+    @MaxMem INT = 90,
+    @P_MAXDOP INT,
+    @CostThreshold INT = 50,
+    @DBfile NVARCHAR(500),
+    @Logfile NVARCHAR(500),
+    @Backup NVARCHAR(500),
+    @TempfilePath NVARCHAR(500), -- MANDATORY: Set before execution
+    @TempfileSize NVARCHAR(100) = '100MB',
+    @MaximumMemory INT;
+
+-- Enable advanced options
 EXEC sp_configure 'show advanced options', 1;
+RECONFIGURE;
 
--- Other Settings as per the Best Practice 
-EXEC sp_configure 'index create memory', 0
+-- ==========================
+-- General Best Practice Settings
+-- ==========================
+EXEC sp_configure 'index create memory', 0;
 RECONFIGURE;
 EXEC sp_configure 'min memory per query', 1024;
 RECONFIGURE;
@@ -87,142 +101,137 @@ RECONFIGURE;
 EXEC sp_configure 'fill factor', 0;
 RECONFIGURE;
 EXEC sp_configure 'backup compression default', 1;
-RECONFIGURE WITH OVERRIDE ;
+RECONFIGURE WITH OVERRIDE;
 
--- Setting up Min/Max SQL Memory
-SET @MinMem = coalesce(nullif(@MinMem, ''), 0)
-DECLARE @MaximumMememory int
-SET @MaxMem = coalesce(nullif(@MaxMem, ''), 90)
-Select @MaximumMememory=(select ([total_physical_memory_kb] / 1024  * @MaxMem/100) as totalmin
-    FROM [master].[sys].[dm_os_sys_memory])
-Exec sp_configure 'min server memory', @MinMem;
-Exec sp_configure 'max server memory', @MaximumMememory;
+-- ==========================
+-- Memory Configuration
+-- ==========================
+SELECT @MaximumMemory = ([total_physical_memory_kb] / 1024 * @MaxMem / 100)
+FROM [master].[sys].[dm_os_sys_memory];
 
--- Setting up MAX DOP and Cost Threshold limit
-DECLARE @hyperthreadingRatio bit
-DECLARE @logicalCPUs int
-DECLARE @HTEnabled int
-DECLARE @physicalCPU int
-DECLARE @SOCKET int
-DECLARE @logicalCPUPerNuma int
-DECLARE @NoOfNUMA int
-DECLARE @MaxDOP int
+EXEC sp_configure 'min server memory', @MinMem;
+RECONFIGURE;
+EXEC sp_configure 'max server memory', @MaximumMemory;
+RECONFIGURE;
 
-select @logicalCPUs = cpu_count -- [Logical CPU Count]
-    , @hyperthreadingRatio = hyperthread_ratio --  [Hyperthread Ratio]
-    , @physicalCPU = cpu_count / hyperthread_ratio -- [Physical CPU Count]
-    , @HTEnabled = case 
-        when cpu_count > hyperthread_ratio
-            then 1
-        else 0
-        end
--- HTEnabled
-from sys.dm_os_sys_info
-option
-(recompile);
+-- ==========================
+-- MAXDOP and Cost Threshold
+-- ==========================
+DECLARE 
+    @logicalCPUs INT,
+    @hyperthreadingRatio INT,
+    @physicalCPU INT,
+    @HTEnabled INT,
+    @logicalCPUPerNuma INT,
+    @NoOfNUMA INT;
 
-select @logicalCPUPerNuma = COUNT(parent_node_id)
--- [NumberOfLogicalProcessorsPerNuma]
-from sys.dm_os_schedulers
-where [status] = 'VISIBLE ONLINE'
-    and parent_node_id < 64
-group by parent_node_id
-option
-(recompile);
+SELECT 
+    @logicalCPUs = cpu_count,
+    @hyperthreadingRatio = hyperthread_ratio,
+    @physicalCPU = cpu_count / hyperthread_ratio,
+    @HTEnabled = CASE WHEN cpu_count > hyperthread_ratio THEN 1 ELSE 0 END
+FROM sys.dm_os_sys_info;
 
-select @NoOfNUMA = count(distinct parent_node_id)
-from sys.dm_os_schedulers
--- find NO OF NUMA Nodes 
-where [status] = 'VISIBLE ONLINE'
-    and parent_node_id < 64
-SET @P_MAXDOP = coalesce(nullif(@P_MAXDOP, ''), (select
-    --- 8 or less processors and NO HT enabled
-    case 
-        when @logicalCPUs < 8
-            and @HTEnabled = 0
-            then CAST(@logicalCPUs as varchar(3))
-                --- 8 or more processors and NO HT enabled
-        when @logicalCPUs >= 8
-            and @HTEnabled = 0
-            then  8
-                --- 8 or more processors and HT enabled and NO NUMA
-        when @logicalCPUs >= 8
-            and @HTEnabled = 1
-            and @NoofNUMA = 1
-            then CAST(@logicalCPUPerNuma / @physicalCPU as varchar(3))
-                --- 8 or more processors and HT enabled and NUMA
-        when @logicalCPUs >= 8
-            and @HTEnabled = 1
-            and @NoofNUMA > 1
-            then CAST(@logicalCPUPerNuma / @physicalCPU as varchar(3))
-        else ''
-        end as Recommendations
-))
-SET @CostThresHold = coalesce(nullif(@CostThresHold, ''), 50)
-EXEC sp_configure 'max degree of parallelism', @P_MAXDOP
-EXEC sp_configure 'cost threshold for parallelism', @CostThresHold
-;
+SELECT TOP 1 @logicalCPUPerNuma = COUNT(*) 
+FROM sys.dm_os_schedulers
+WHERE [status] = 'VISIBLE ONLINE'
+    AND parent_node_id < 64
+GROUP BY parent_node_id;
 
--- Setting up Default Directories for Data/Log/Backup
-DECLARE @BackupDirectory NVARCHAR(100)
-EXEC master..xp_instance_regread @rootkey = 'HKEY_LOCAL_MACHINE',  
+SELECT @NoOfNUMA = COUNT(DISTINCT parent_node_id)
+FROM sys.dm_os_schedulers
+WHERE [status] = 'VISIBLE ONLINE'
+    AND parent_node_id < 64;
+
+-- Calculate MAXDOP Recommendation
+IF (@logicalCPUs < 8 AND @HTEnabled = 0)
+    SET @P_MAXDOP = @logicalCPUs;
+ELSE IF (@logicalCPUs >= 8 AND @HTEnabled = 0)
+    SET @P_MAXDOP = 8;
+ELSE IF (@logicalCPUs >= 8 AND @HTEnabled = 1 AND @NoOfNUMA = 1)
+    SET @P_MAXDOP = @logicalCPUPerNuma / @physicalCPU;
+ELSE IF (@logicalCPUs >= 8 AND @HTEnabled = 1 AND @NoOfNUMA > 1)
+    SET @P_MAXDOP = @logicalCPUPerNuma / @physicalCPU;
+
+-- Apply MAXDOP and Cost Threshold
+EXEC sp_configure 'max degree of parallelism', @P_MAXDOP;
+RECONFIGURE;
+EXEC sp_configure 'cost threshold for parallelism', @CostThreshold;
+RECONFIGURE;
+
+-- ==========================
+-- Default Directories
+-- ==========================
+DECLARE @BackupDirectory NVARCHAR(500);
+EXEC master..xp_instance_regread 
+    @rootkey = 'HKEY_LOCAL_MACHINE',  
     @key = 'Software\Microsoft\MSSQLServer\MSSQLServer',  
-    @value_name = 'BackupDirectory', @BackupDirectory = @BackupDirectory OUTPUT
-;
-SET @Backup = coalesce(nullif(@Backup, ''), @BackupDirectory)
-SET @DBfile = coalesce(nullif(@DBfile, ''), (SELECT CONVERT(nvarchar(500), SERVERPROPERTY('INSTANCEDEFAULTDATAPATH'))))
-SET @Logfile = coalesce(nullif(@Logfile, ''), (SELECT CONVERT(nvarchar(500), SERVERPROPERTY('INSTANCEDEFAULTLOGPATH'))))
+    @value_name = 'BackupDirectory', 
+    @BackupDirectory = @BackupDirectory OUTPUT;
 
+SET @Backup = ISNULL(NULLIF(@Backup, ''), @BackupDirectory);
+SET @DBfile = ISNULL(NULLIF(@DBfile, ''), CONVERT(NVARCHAR(500), SERVERPROPERTY('INSTANCEDEFAULTDATAPATH')));
+SET @Logfile = ISNULL(NULLIF(@Logfile, ''), CONVERT(NVARCHAR(500), SERVERPROPERTY('INSTANCEDEFAULTLOGPATH')));
 
-EXEC   xp_instance_regwrite 
-N'HKEY_LOCAL_MACHINE', 
-N'Software\Microsoft\MSSQLServer\MSSQLServer', 
-N'DefaultData', 
-REG_SZ, 
-@DBfile
+BEGIN TRY
+    EXEC xp_instance_regwrite 
+        N'HKEY_LOCAL_MACHINE', 
+        N'Software\Microsoft\MSSQLServer\MSSQLServer', 
+        N'DefaultData', 
+        REG_SZ, 
+        @DBfile;
 
-EXEC   xp_instance_regwrite 
-N'HKEY_LOCAL_MACHINE', 
-N'Software\Microsoft\MSSQLServer\MSSQLServer', 
-N'DefaultLog', 
-REG_SZ, 
-@Logfile
+    EXEC xp_instance_regwrite 
+        N'HKEY_LOCAL_MACHINE', 
+        N'Software\Microsoft\MSSQLServer\MSSQLServer', 
+        N'DefaultLog', 
+        REG_SZ, 
+        @Logfile;
 
-EXEC   xp_instance_regwrite 
-N'HKEY_LOCAL_MACHINE', 
-N'Software\Microsoft\MSSQLServer\MSSQLServer', 
-N'BackupDirectory', 
-REG_SZ, 
-@Logfile  
+    EXEC xp_instance_regwrite 
+        N'HKEY_LOCAL_MACHINE', 
+        N'Software\Microsoft\MSSQLServer\MSSQLServer', 
+        N'BackupDirectory', 
+        REG_SZ, 
+        @Backup;
+END TRY
+BEGIN CATCH
+    PRINT 'Error setting registry values: ' + ERROR_MESSAGE();
+END CATCH
 
--- Add temp files
--- Calculate Number of Required TempDB Files
-Declare @cpu int =( SELECT count(cpu_count)
-FROM sys.dm_os_sys_info )
-Declare @currenttempfine int = (SELECT count(name)
-FROM tempdb.sys.database_files)
-Declare @requiredtmpfiles int
-IF @cpu < 8  Set @requiredtmpfiles = 5
-IF @CPU >8  Set @requiredtmpfiles = 9
+-- ==========================
+-- TempDB Files Configuration
+-- ==========================
+DECLARE 
+    @cpu INT = (SELECT cpu_count FROM sys.dm_os_sys_info),
+    @currentTempFiles INT = (SELECT COUNT(*) FROM tempdb.sys.database_files),
+    @requiredTempFiles INT,
+    @int INT = 1,
+    @maxFile INT;
 
--- Declare variables for adding new tempDB files
-Declare @int int
-Declare @MAX_File int
+SET @requiredTempFiles = CASE WHEN @cpu < 8 THEN 5 ELSE 9 END;
 
-SET @TempfileSize = coalesce(nullif(@TempfileSize, ''), '100MB')
-
-IF @currenttempfine = @requiredtmpfiles    Print 'TempDB Files Are OK'
-SET @int=1
-Set @MAX_File = (@requiredtmpfiles -@currenttempfine)
-
--- Adding TempDB Files
-WHILE @int <= @MAX_File
-   Begin
-    Declare @addfiles nvarchar(500)= (select 'ALTER DATABASE [tempdb] ADD FILE (NAME = '+'''tempdb_'+cast(@int as nvarchar(10))+''', FILENAME ='''+@TempfilePath+'tempdb_'+cast(@int as nvarchar(10))+'.ndf'' , SIZE = '+cast(@TempfileSize as nvarchar(10))+')' )
-    --print @addfiles
-    EXEC (@addfiles)
-    SET @int=@int+1
+IF @currentTempFiles = @requiredTempFiles
+    PRINT 'TempDB Files Are OK';
+ELSE IF @currentTempFiles > @requiredTempFiles
+    PRINT CAST(@currentTempFiles - @requiredTempFiles AS NVARCHAR(100)) + ' files need to be removed';
+ELSE
+BEGIN
+    SET @maxFile = @requiredTempFiles - @currentTempFiles;
+    WHILE @int <= @maxFile
+    BEGIN
+        DECLARE @addfiles NVARCHAR(1000) = 
+            'ALTER DATABASE [tempdb] ADD FILE (NAME = N''tempdb_' + CAST(@int AS NVARCHAR(10)) +
+            ''', FILENAME = N''' + @TempfilePath + 'tempdb_' + CAST(@int AS NVARCHAR(10)) + 
+            '.ndf'', SIZE = ' + @TempfileSize + ')';
+        PRINT @addfiles;
+        BEGIN TRY
+            EXEC (@addfiles);
+        END TRY
+        BEGIN CATCH
+            PRINT 'Error adding TempDB file: ' + ERROR_MESSAGE();
+        END CATCH
+        SET @int = @int + 1;
+    END
 END
-IF @currenttempfine > @requiredtmpfiles print Cast(@currenttempfine-@requiredtmpfiles  as nvarchar(100))+' File need to be removed'
 GO
- 
