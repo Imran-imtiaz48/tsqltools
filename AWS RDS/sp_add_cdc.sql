@@ -30,70 +30,96 @@ License: GPL-3.0
 
 -- READ THE DESCRIPTION BEFORE EXECUTE THIS ***
 IF OBJECT_ID('dbo.sp_add_cdc') IS NULL
-  EXEC ('CREATE PROCEDURE dbo.sp_add_cdc AS RETURN 0;');
+    EXEC ('CREATE PROCEDURE dbo.sp_add_cdc AS RETURN 0;');
 GO
 
 ALTER PROCEDURE [dbo].[sp_add_cdc]
     @cdcdbname NVARCHAR(100)
-as begin
-    exec msdb.dbo.rds_cdc_enable_db @cdcdbname
-    DECLARE @name VARCHAR(50)
-    -- For PrimaryKey Tables
-    DECLARE primary_tbl_cursor CURSOR FOR  
-SELECT t1.table_name
-    FROM INFORMATION_SCHEMA.TABLES t1
-        Join INFORMATION_SCHEMA.TABLE_CONSTRAINTS t2 on t1.TABLE_NAME=t2.TABLE_NAME
-        Join sys.tables t3 on t1.table_name = t3.name
-    WHERE t1.TABLE_TYPE='BASE TABLE' and t2.CONSTRAINT_TYPE='PRIMARY KEY' and t1.table_schema !='cdc' and t3.is_tracked_by_cdc=0;
-    OPEN primary_tbl_cursor
-    FETCH NEXT FROM primary_tbl_cursor INTO @name
-    WHILE @@FETCH_STATUS = 0   
+AS
 BEGIN
-        declare @primary int = 1
-        declare @p_schema nvarchar(100)=(select table_schema
-        FROM INFORMATION_SCHEMA.TABLES
-        where TABLE_NAME=@name)
-        declare @p_tbl nvarchar(100)=(select table_name
-        FROM INFORMATION_SCHEMA.TABLES
-        where TABLE_NAME=@name)
-        exec sys.sp_cdc_enable_table 
-@source_schema = @p_schema, 
-@source_name = @p_tbl, 
-@role_name = NULL, 
-@supports_net_changes = @primary
+    SET NOCOUNT ON;
+    BEGIN TRY
+        -- Enable CDC at the database level
+        EXEC msdb.dbo.rds_cdc_enable_db @cdcdbname;
 
-        FETCH NEXT FROM primary_tbl_cursor INTO @name
-    END
-    CLOSE primary_tbl_cursor
-    DEALLOCATE primary_tbl_cursor
+        -- Cursor for Primary Key tables not already tracked by CDC
+        DECLARE @pk_schema NVARCHAR(100), @pk_table NVARCHAR(100);
+        DECLARE primary_tbl_cursor CURSOR FOR
+            SELECT t1.table_schema, t1.table_name
+            FROM INFORMATION_SCHEMA.TABLES AS t1
+            INNER JOIN INFORMATION_SCHEMA.TABLE_CONSTRAINTS AS t2
+                ON t1.TABLE_NAME = t2.TABLE_NAME AND t1.table_schema = t2.table_schema
+            INNER JOIN sys.tables AS t3
+                ON t1.table_name = t3.name
+            WHERE t1.TABLE_TYPE = 'BASE TABLE'
+              AND t2.CONSTRAINT_TYPE = 'PRIMARY KEY'
+              AND t1.table_schema != 'cdc'
+              AND t3.is_tracked_by_cdc = 0;
 
-    -- For Non-PrimaryKey Tables
+        OPEN primary_tbl_cursor;
+        FETCH NEXT FROM primary_tbl_cursor INTO @pk_schema, @pk_table;
+        WHILE @@FETCH_STATUS = 0
+        BEGIN
+            EXEC sys.sp_cdc_enable_table
+                @source_schema = @pk_schema,
+                @source_name = @pk_table,
+                @role_name = NULL,
+                @supports_net_changes = 1;
 
-    DECLARE nonprimary_cursor CURSOR FOR  
-SELECT table_name
-    FROM INFORMATION_SCHEMA.TABLES Join sys.tables t3 on table_name = t3.name
-    where TABLE_NAME not in (select table_name
-        from INFORMATION_SCHEMA.TABLE_CONSTRAINTS) and table_schema !='cdc' and TABLE_NAME !='systranschemas' and t3.is_tracked_by_cdc=0;
+            FETCH NEXT FROM primary_tbl_cursor INTO @pk_schema, @pk_table;
+        END
+        CLOSE primary_tbl_cursor;
+        DEALLOCATE primary_tbl_cursor;
 
-    OPEN nonprimary_cursor
-    FETCH NEXT FROM nonprimary_cursor INTO @name
-    WHILE @@FETCH_STATUS = 0   
-BEGIN
-        declare @n_primary int = 0
-        declare @n_schema nvarchar(100)=(select table_schema
-        FROM INFORMATION_SCHEMA.TABLES
-        where TABLE_NAME=@name)
-        declare @n_tbl nvarchar(100)=(select table_name
-        FROM INFORMATION_SCHEMA.TABLES
-        where TABLE_NAME=@name)
-        exec sys.sp_cdc_enable_table 
-@source_schema = @n_schema, 
-@source_name = @n_tbl, 
-@role_name = NULL, 
-@supports_net_changes = @n_primary
+        -- Cursor for tables without Primary Key and not tracked by CDC
+        DECLARE @np_schema NVARCHAR(100), @np_table NVARCHAR(100);
+        DECLARE nonprimary_cursor CURSOR FOR
+            SELECT t1.table_schema, t1.table_name
+            FROM INFORMATION_SCHEMA.TABLES AS t1
+            INNER JOIN sys.tables AS t3
+                ON t1.table_name = t3.name
+            WHERE t1.TABLE_TYPE = 'BASE TABLE'
+              AND t1.table_schema != 'cdc'
+              AND t3.is_tracked_by_cdc = 0
+              AND t1.table_name != 'systranschemas'
+              AND NOT EXISTS (
+                    SELECT 1
+                    FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS AS t2
+                    WHERE t2.table_name = t1.table_name
+                    AND t2.table_schema = t1.table_schema
+                    AND t2.CONSTRAINT_TYPE = 'PRIMARY KEY'
+              );
 
-        FETCH NEXT FROM nonprimary_cursor INTO @name
-    END
-    CLOSE nonprimary_cursor
-    DEALLOCATE nonprimary_cursor
+        OPEN nonprimary_cursor;
+        FETCH NEXT FROM nonprimary_cursor INTO @np_schema, @np_table;
+        WHILE @@FETCH_STATUS = 0
+        BEGIN
+            EXEC sys.sp_cdc_enable_table
+                @source_schema = @np_schema,
+                @source_name = @np_table,
+                @role_name = NULL,
+                @supports_net_changes = 0;
+
+            FETCH NEXT FROM nonprimary_cursor INTO @np_schema, @np_table;
+        END
+        CLOSE nonprimary_cursor;
+        DEALLOCATE nonprimary_cursor;
+    END TRY
+    BEGIN CATCH
+        -- Clean up cursors if error occurs
+        IF CURSOR_STATUS('global', 'primary_tbl_cursor') >= -1
+        BEGIN
+            CLOSE primary_tbl_cursor;
+            DEALLOCATE primary_tbl_cursor;
+        END
+        IF CURSOR_STATUS('global', 'nonprimary_cursor') >= -1
+        BEGIN
+            CLOSE nonprimary_cursor;
+            DEALLOCATE nonprimary_cursor;
+        END
+
+        -- Rethrow error
+        THROW;
+    END CATCH
 END
+GO
